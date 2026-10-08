@@ -1,4 +1,8 @@
 /*
+ * 【中文导读】ef_utils.c —— CRC8/CRC32 校验工具（B级导读）
+ */
+
+/*
  * This file is part of the EasyFlash Library.
  *
  * Copyright (c) 2015-2017, Armink, <armink.ztl@gmail.com>

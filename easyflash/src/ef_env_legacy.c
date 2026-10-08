@@ -1,4 +1,9 @@
 /*
+ * 【中文导读】ef_env_legacy.c —— ENV 旧版实现：文件模式（B级导读）
+ * 依赖文件系统（FAT 等）存 env，把 KV 写进普通文件。了解即可。
+ */
+
+/*
  * This file is part of the EasyFlash Library.
  *
  * Copyright (c) 2014-2018, Armink, <armink.ztl@gmail.com>

@@ -1,4 +1,9 @@
 /*
+ * 【中文导读】ef_env_legacy_wl.c —— ENV 旧版实现：4字节+软件磨损均衡（B级导读）
+ * 在裸 Flash 上用映射表实现磨损均衡的旧方案，被现在的 ef_env.c 取代。
+ */
+
+/*
  * This file is part of the EasyFlash Library.
  *
  * Copyright (c) 2015-2018, Armink, <armink.ztl@gmail.com>

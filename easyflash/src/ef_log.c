@@ -1,4 +1,9 @@
 /*
+ * 【中文导读】ef_log.c —— Flash 日志存储（B级导读）
+ * 日志当环形存储直接写 Flash：顺序追加、按下标回读。死机排查利器。
+ */
+
+/*
  * This file is part of the EasyFlash Library.
  *
  * Copyright (c) 2015-2019, Armink, <armink.ztl@gmail.com>

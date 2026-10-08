@@ -1,4 +1,9 @@
 /*
+ * 【中文导读】ef_iap.c —— IAP 在线固件升级辅助（B级导读）
+ * 设置升级标志、校验固件包 CRC、分包写入。做 OTA 时参考分包校验逻辑。
+ */
+
+/*
  * This file is part of the EasyFlash Library.
  *
  * Copyright (c) 2015-2017, Armink, <armink.ztl@gmail.com>
