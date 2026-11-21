@@ -26,6 +26,19 @@
  * Created on: 2019-11-20
  */
 
+/*
+ * ============================================================================
+ * 【B级导读】ef_def.h —— 公共定义头：版本号 / 日志宏 / 错误码 / KV 状态机 / KV 对象
+ * ----------------------------------------------------------------------------
+ * 全库地基：easyflash.h 与所有 src 实现都包含它。核心三件事：
+ *   1. enum env_status + struct env_node_obj：NG 模式 KV 节点的状态机与内存对象，
+ *      Docs/02 的 stateDiagram 直接对应这里的 6 个状态；
+ *   2. EfErrCode：全库统一错误码（API 返回值契约）；
+ *   3. EF_DEBUG/EF_INFO/EF_ASSERT：日志与断言宏，行为由 PRINT_DEBUG 控制。
+ * 注意：EF_ASSERT 是带续行符的多行宏，任何修改严禁在宏体中间插注释。
+ * ============================================================================
+ */
+
 #ifndef EF_DEF_H_
 #define EF_DEF_H_
 
@@ -73,6 +86,10 @@ typedef struct _ef_env {
 } ef_env, *ef_env_t;
 
 /* EasyFlash error code */
+/*
+ * 【深注】全库错误码契约：0 恒为成功；1~3 是移植层 IO 三兄弟；4~7 是 ENV 业务错。
+ * 上层可直接 switch 这些值做重试/降级策略。
+ */
 typedef enum {
     EF_NO_ERR,
     EF_ERASE_ERR,
@@ -85,12 +102,23 @@ typedef enum {
 } EfErrCode;
 
 /* the flash sector current status */
+/* 【深注】legacy 体系用的扇区三态（空/在用/满）；NG 模式另有更细的双轴状态见 ef_env.c */
 typedef enum {
     EF_SECTOR_EMPTY,
     EF_SECTOR_USING,
     EF_SECTOR_FULL,
-} EfSecrorStatus;
+} EfSecrorStatus; /* 拼写笔误 EfSecror（原样保留），仅本枚举，无碍使用 */
 
+/*
+ * 【深注】KV 节点状态机（NG 模式，status table 按写粒度逐位/逐格落盘，
+ * 只能沿"写入方向"前进，天然单调——这是追加写掉电安全的基础）：
+ *   ENV_UNUSED     0xFF..：擦除态，此节点从未写过；
+ *   ENV_PRE_WRITE  已写状态表但头/数据未写完（掉电在此状态 -> 上电标 ENV_ERR_HDR 作废）；
+ *   ENV_WRITE      完整有效（CRC 过），set/get 只认这个状态；
+ *   ENV_PRE_DELETE 已标记待删（同名覆盖时先打此标记；掉电 -> 上电 move_env 恢复旧值）；
+ *   ENV_DELETED    彻底删除（GC 搬运时新副本已写好才打这个标）；
+ *   ENV_ERR_HDR    头部错误（长度非法/半写），节点作废但保留元数据不撞坏相邻数据。
+ */
 enum env_status {
     ENV_UNUSED,
     ENV_PRE_WRITE,
@@ -98,10 +126,15 @@ enum env_status {
     ENV_PRE_DELETE,
     ENV_DELETED,
     ENV_ERR_HDR,
-    ENV_STATUS_NUM,
+    ENV_STATUS_NUM, /* 状态总数：决定 status table 大小（见 ef_env.c 的 STATUS_TABLE_SIZE） */
 };
 typedef enum env_status env_status_t;
 
+/*
+ * 【深注】env_node_obj：一条 KV 在 RAM 中的"元数据视图"（不含值本体，值留在 Flash）。
+ * name[EF_ENV_NAME_MAX] 是内嵌数组而非指针——find_env 读头时一并读入，避免二次读闪；
+ * addr.start/value 分别指向节点头与值本体（Flash 绝对地址），ef_read_env_value 据此读值。
+ */
 struct env_node_obj {
     env_status_t status;                         /**< ENV node status, @see node_status_t */
     bool crc_is_ok;                              /**< ENV node CRC32 check is OK */

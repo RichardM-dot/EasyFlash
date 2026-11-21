@@ -4,6 +4,21 @@
  */
 
 /*
+ * 【深读地图（A级深注补充）】本文件是 legacy 体系的"磨损均衡（WL）模式"：
+ * RAM 全缓存 + 数据段可在多个扇区间"搬家"。与 ef_env_legacy.c（normal 模式）
+ * 的三点本质区别：
+ *   1. 多了一个系统扇区：ENV 区第一个扇区（EF_ERASE_MIN_SIZE）只存一个字——
+ *      cur_using_data_addr（当前数据段在哪个扇区起始），其余扇区才是数据段；
+ *   2. 保存 = 把 RAM 镜像搬到 cur_using_data_addr 处；若擦/写失败（坏块），
+ *      cur_using_data_addr 向后平移一个 EF_ERASE_MIN_SIZE 重试——坏块被自然绕开，
+ *      写入点随时间在 Flash 上游走，磨损被摊薄（软件版 wear leveling）；
+ *   3. 游标/搬移全部按绝对 Flash 地址管理，get_env_user_used_size 等语义与
+ *      normal 模式略有差异（基于 cur_using_data_addr 而非固定区首）。
+ * 可选 EF_ENV_USING_PFS_MODE 双区乒乓逻辑与 normal 模式一致（见其 ef_load_env）。
+ * 任务书所述 kg 用户配置模式在本版本无独立实现文件，相关说明统一并入 env 体系。
+ */
+
+/*
  * This file is part of the EasyFlash Library.
  *
  * Copyright (c) 2015-2018, Armink, <armink.ztl@gmail.com>
@@ -62,6 +77,17 @@
  * @note It will has two ENV areas(Area0, Area1) in data section when used power fail safeguard mode.
  */
 
+/*
+ * 【深注】参数区（ENV parameters part）布局：位于 cur_using_data_addr 处，按字索引。
+ * 与 normal 模式的差异：这里"参数区+详情区"合起来才是数据段（data section），
+ * 且数据段首地址不固定——由系统扇区里的 cur_using_data_addr 指定，坏块时会搬家。
+ *
+ *   字偏移 0            1(optional)   2(optional)   3(optional)
+ *        +-------------+-------------+-------------+-------------+
+ *        | 详情区结束   | 保存计数(PFS)| 版本号(自动  | 详情区CRC32 |
+ *        | 地址(必选)   |             | 更新时)      |             |
+ *        +-------------+-------------+-------------+-------------+
+ */
 /* flash ENV parameters part index and size */
 enum {
     /* data section ENV detail part end address index */
@@ -86,24 +112,31 @@ enum {
 };
 
 /* default ENV set, must be initialized by user */
+/* 【深注】用户默认 ENV 表：ef_port_init() 传入，仅 set_default/自动升级时使用 */
 static ef_env const *default_env_set;
 /* default ENV set size, must be initialized by user */
 static size_t default_env_set_size = 0;
 /* flash ENV data section size */
+/* 【深注】数据段总容量 = ENV 区大小 - 系统扇区（PFS 时再减半）。init 时算好缓存 */
 static size_t env_data_section_size = 0;
 /* ENV ram cache */
+/* 【深注】ENV 镜像 RAM 缓存：前 ENV_PARAM_PART_WORD_SIZE 字是参数区，其后是 "key=value\0" 流 */
 static uint32_t env_cache[ENV_USER_SETTING_SIZE / 4] = { 0 };
 /* ENV start address in flash */
+/* 【深注】ENV 区物理首地址（= EF_START_ADDR），也即"系统扇区"所在位置 */
 static uint32_t env_start_addr = 0;
 /* current using data section address */
+/* 【深注】灵魂全局：当前数据段起始地址（存在系统扇区的那个字）。坏块搬家/乒乓切换都改它 */
 static uint32_t cur_using_data_addr = 0;
 /* ENV ram cache has changed when ENV created, deleted and changed value. */
+/* 【深注】脏标志：set/del 只改 RAM 并置位，落盘统一由 ef_save_env 执行 */
 static bool env_cache_changed = false;
 /* initialize OK flag */
-static bool init_ok = false;
+static bool init_ok = false; /* API 前置检查：未挂载拒绝服务 */
 
 #ifdef EF_ENV_USING_PFS_MODE
 /* next save ENV area address */
+/* 【深注】PFS 乒乓：下一次保存的目标数据段地址（Area0 侧或 Area1 侧），语义同 normal 模式 */
 static uint32_t next_save_area_addr = 0;
 #endif
 
@@ -128,6 +161,12 @@ static EfErrCode env_auto_update(void);
 
 /**
  * Flash ENV initialize.
+ * 【深注】ef_env_init() —— WL 模式挂载：先算数据段边界，再交给 ef_load_env 恢复。
+ *
+ * 布局公式（与 normal 模式不同的关键）：
+ *   普通模式：数据段 = ENV 区 - 1 个系统扇区，单副本；
+ *   PFS 模式：数据段 = ENV 区/2 - 1 个系统扇区，双区乒乓（要求扇区数为偶数）。
+ * 断言链保证 ENV_USER_SETTING_SIZE 不超过数据段容量，否则上电即 assert 死循环。
  *
  * @param default_env default ENV set for user
  * @param default_env_size default ENV set size
@@ -181,6 +220,9 @@ EfErrCode ef_env_init(ef_env const *default_env, size_t default_env_size) {
 
 /**
  * ENV set default.
+ * 【深注】ef_env_set_default() —— 出厂重建：清 RAM 游标 -> 重放默认表 -> 落盘。
+ * 触发点都在 ef_load_env：首次上电/游标非法/CRC 失败/PFS 双区皆毁。
+ * 与 normal 模式完全同构，只是游标语义换成了"详情区结束地址"。
  *
  * @return result
  */
@@ -230,6 +272,7 @@ EfErrCode ef_env_set_default(void) {
 
 /**
  * Get ENV start address in flash.
+ * 【深注】get_env_start_addr() —— ENV 区物理首地址（系统扇区处）。
  *
  * @return ENV start address in flash
  */
@@ -238,6 +281,8 @@ static uint32_t get_env_start_addr(void) {
 }
 /**
  * Get current using data section address.
+ * 【深注】get_cur_using_data_addr() —— 读"当前数据段起始地址"游标（RAM 副本）。
+ * 该值的持久化载体在系统扇区，坏块搬家/掉电恢复都围绕它展开。
  *
  * @return current using data section address
  */
@@ -247,6 +292,8 @@ static uint32_t get_cur_using_data_addr(void) {
 
 /**
  * Set current using data section address.
+ * 【深注】set_cur_using_data_addr() —— 写数据段游标（仅 RAM）。
+ * ef_save_env 搬家失败时用它平移到下一个扇区，持久化靠 save_cur_using_data_addr。
  *
  * @param using_data_addr current using data section address
  */
@@ -256,6 +303,7 @@ static void set_cur_using_data_addr(uint32_t using_data_addr) {
 
 /**
  * Get ENV detail part start address.
+ * 【深注】get_env_detail_addr() —— 详情区（"key=value\0" 流）起始 = 数据段首 + 参数区定长。
  *
  * @return detail part start address
  */
@@ -266,6 +314,8 @@ static uint32_t get_env_detail_addr(void) {
 /**
  * Get ENV detail part end address.
  * It's the first word in ENV.
+ * 【深注】get_env_detail_end_addr() —— 读详情区结束地址游标（参数区第 0 字，
+ * 绝对 Flash 地址）。上电自 Flash 恢复，运行期随 write_env/del_env 在 RAM 推进。
  *
  * @return ENV end address
  */
@@ -277,6 +327,8 @@ static uint32_t get_env_detail_end_addr(void) {
 /**
  * Set ENV detail part end address.
  * It's the first word in ENV.
+ * 【深注】set_env_detail_end_addr() —— 写详情区结束地址游标（仅 RAM）。
+ * 注意搬家场景（ef_save_env 失败重试）会把它整体平移 EF_ERASE_MIN_SIZE。
  *
  * @param end_addr ENV end address
  */
@@ -286,6 +338,8 @@ static void set_env_detail_end_addr(uint32_t end_addr) {
 
 /**
  * Get current ENV detail part size.
+ * 【深注】get_env_detail_size() —— 详情区有效长度 = 结束地址 - 详情区首。
+ * CRC 覆盖范围与 find_env 扫描边界都以它为准。
  *
  * @return size
  */
@@ -299,6 +353,8 @@ static size_t get_env_detail_size(void) {
 
 /**
  * Get current user used ENV size.
+ * 【深注】get_env_user_used_size() —— 用户区占用 = 详情区结束地址 - 数据段首
+ * （即参数区+详情区合计，落盘搬家的搬运量 write_size 就用它）。
  *
  * @see ENV_USER_SETTING_SIZE
  *
@@ -315,6 +371,8 @@ static size_t get_env_user_used_size(void) {
 
 /**
  * Get current ENV already write bytes.
+ * 【深注】ef_get_env_write_bytes() —— 已写字节统计：普通模式 = 结束地址-区首
+ * （含系统扇区）；PFS 模式 = 1 个系统扇区 + 当前区内占用。供 ef_print_env 展示。
  *
  * @return write bytes
  */
@@ -328,6 +386,13 @@ size_t ef_get_env_write_bytes(void) {
 
 /**
  * Write an ENV at the end of cache.
+ * 【深注】write_env() —— RAM 缓存末尾追加 "key=value\0" 记录（与 normal 模式同构，
+ * 仅追加点计算不同：参数区在 env_cache 头部，数据流起点 = ENV_PARAM_PART_BYTE_SIZE）。
+ *
+ * @note  源码细节：局部变量名 ker_len 是 key_len 的笔误（原作者拼写），不影响逻辑，
+ *        按红线约定此处仅记录不修改。
+ * @note  容量判断以 ENV_USER_SETTING_SIZE（RAM 缓存尺寸）为界，与 Flash 数据段
+ *        实际余量（env_data_section_size）的关系由 ef_env_init 的断言链保证。
  *
  * @param key ENV name
  * @param value ENV value
@@ -342,14 +407,14 @@ static EfErrCode write_env(const char *key, const char *value) {
     /* calculate ENV storage length, contain '=' and '\0'. */
     env_str_len = ker_len + value_len + 2;
     if (env_str_len % 4 != 0) {
-        env_str_len = (env_str_len / 4 + 1) * 4;
+        env_str_len = (env_str_len / 4 + 1) * 4; /* 4 字节对齐向上取整 */
     }
     /* check capacity of ENV  */
     if (env_str_len + get_env_user_used_size() >= ENV_USER_SETTING_SIZE) {
-        return EF_ENV_FULL;
+        return EF_ENV_FULL; /* RAM 缓存不足，拒绝写入 */
     }
     /* calculate current ENV ram cache end address */
-    env_cache_bak += ENV_PARAM_PART_BYTE_SIZE + get_env_detail_size();
+    env_cache_bak += ENV_PARAM_PART_BYTE_SIZE + get_env_detail_size(); /* 追加点 = 参数区+已有详情区之后 */
     /* copy key name */
     memcpy(env_cache_bak, key, ker_len);
     env_cache_bak += ker_len;
@@ -373,6 +438,9 @@ static EfErrCode write_env(const char *key, const char *value) {
 
 /**
  * Find ENV.
+ * 【深注】find_env() —— RAM 详情区线性扫描（strncmp 前缀 + '=' 全名确认 +
+ * strlen 对齐跳步），算法与 normal 模式 find_env 逐行同构，仅边界基于
+ * ENV_PARAM_PART_BYTE_SIZE/get_env_detail_size 计算。复杂度 O(记录数×长度)。
  *
  * @param key ENV name
  *
@@ -420,6 +488,8 @@ static char *find_env(const char *key) {
 /**
  * If the ENV is not exist, create it.
  * @see flash_write_env
+ * 【深注】create_env() —— 创建闸门：key 非空 / 不含 '=' / 同名不存在，
+ * 三道检查后转 write_env 追加。与 normal 模式同构。
  *
  * @param key ENV name
  * @param value ENV value
@@ -455,6 +525,8 @@ static EfErrCode create_env(const char *key, const char *value) {
 
 /**
  * Delete an ENV in cache.
+ * 【深注】del_env() —— 删除 = RAM 内 memmove 前移补洞 + 详情区游标回退。
+ * 对齐规则（strlen+1 向上取整 4）必须与 write_env 一致，否则搬移量错位。
  *
  * @param key ENV name
  *
@@ -507,9 +579,13 @@ static EfErrCode del_env(const char *key) {
 /**
  * Set an ENV.If it value is NULL, delete it.
  * If not find it in ENV table, then create it.
+ * 【深注】ef_set_env() —— 写入口：NULL 即删；同值 no-op；异值 del+recreate。
+ * 决策树与 normal 模式一致（详见其同名函数），锁包裹保证"查-删-建"原子性。
+ * 只改 RAM，掉电安全依赖 ef_save_env 的搬家/乒乓机制。
  *
  * @param key ENV name
  * @param value ENV value
+ * @param value ENV value（传 NULL 等效删除）
  *
  * @return result
  */
@@ -519,7 +595,7 @@ EfErrCode ef_set_env(const char *key, const char *value) {
 
     if (!init_ok) {
         EF_INFO("ENV isn't initialize OK.\n");
-        return EF_ENV_INIT_FAILED;
+        return EF_ENV_INIT_FAILED; /* 未挂载拒绝服务 */
     }
 
     /* lock the ENV cache */
@@ -527,19 +603,19 @@ EfErrCode ef_set_env(const char *key, const char *value) {
 
     /* if ENV value is NULL, delete it */
     if (value == NULL) {
-        result = del_env(key);
+        result = del_env(key); /* set(key,NULL)=del(key) 的约定 */
     } else {
         old_env = find_env(key);
         /* If find this ENV, then compare the new value and old value. */
         if (old_env) {
             /* find the old value address */
-            old_env = strchr(old_env, '=');
+            old_env = strchr(old_env, '='); /* '=' 后即旧值 */
             old_value = old_env + 1;
             /* If it is changed then delete it and recreate it  */
-            if (strcmp(old_value, value)) {
+            if (strcmp(old_value, value)) { /* 同值跳过：省一次整区擦写 */
                 result = del_env(key);
                 if (result == EF_NO_ERR) {
-                    result = create_env(key, value);
+                    result = create_env(key, value); /* 新记录追加到详情区尾部 */
                 }
             }
         } else {
@@ -554,6 +630,7 @@ EfErrCode ef_set_env(const char *key, const char *value) {
 
 /**
  * Del an ENV.
+ * 【深注】ef_del_env() —— 删除对外封装：init 检查 + 缓存锁 + 转发 del_env。
  *
  * @param key ENV name
  *
@@ -580,10 +657,13 @@ EfErrCode ef_del_env(const char *key) {
 
 /**
  * Get an ENV value by key name.
+ * 【深注】ef_get_env() —— 读入口：返回 RAM 详情区内 value 指针（零 Flash 读）。
+ * 指针生命周期属于库缓存，set/del 后可能失效；仅支持字符串值。
  *
  * @param key ENV name
  *
  * @return value
+ * @return value（未找到返回 NULL）
  */
 char *ef_get_env(const char *key) {
     char *env = NULL, *value = NULL;
@@ -609,6 +689,9 @@ char *ef_get_env(const char *key) {
 }
 /**
  * Print ENV.
+ * 【深注】ef_print_env() —— 调试打印：字数组按小端逐字节还原 "key=value" 流，
+ * '\0' 触发换行；尾部打印模式名（wear leveling / +power fail safeguard）、
+ * 用量与已写字节、PFS 保存计数、版本号，现场排查第一入口。
  */
 void ef_print_env(void) {
     uint32_t *env_cache_detail_addr = env_cache + ENV_PARAM_PART_WORD_SIZE, *env_cache_end_addr =
@@ -650,6 +733,16 @@ void ef_print_env(void) {
 
 /**
  * Load flash ENV to ram.
+ * 【深注】ef_load_env()（WL 普通模式版）—— 两级游标依次校验的挂载流程。
+ *
+ * 第 1 级：系统扇区里的 cur_using_data_addr。0xFFFFFFFF（未初始化）或越出
+ *   [区首+系统扇区, 区尾] 即非法 -> 游标复位到区首+EF_ERASE_MIN_SIZE（第一个
+ *   数据扇区），save_cur_using_data_addr 落盘后重建默认 ENV；
+ * 第 2 级：详情区结束地址游标越界 -> 同样复位重建；
+ * 两级都过 -> 从 cur_using_data_addr 恢复参数区+详情区到 RAM，CRC 失败仍重建。
+ *
+ * @note  与 normal 模式的差别：多了一层"数据段在哪"的间接寻址，坏块搬家后
+ *         上电能从系统扇区那一个字找到正确落点。
  *
  * @return result
  */
@@ -659,13 +752,13 @@ EfErrCode ef_load_env(void) {
     uint32_t *env_cache_bak, env_end_addr, using_data_addr;
 
     /* read current using data section address */
-    ef_port_read(get_env_start_addr(), &using_data_addr, 4);
+    ef_port_read(get_env_start_addr(), &using_data_addr, 4); /* 只读系统扇区那 1 个字 */
     /* if ENV is not initialize or flash has dirty data, set default for it */
     if ((using_data_addr == 0xFFFFFFFF)
             || (using_data_addr > get_env_start_addr() + ENV_AREA_SIZE)
             || (using_data_addr < get_env_start_addr() + EF_ERASE_MIN_SIZE)) {
         /* initialize current using data section address */
-        set_cur_using_data_addr(get_env_start_addr() + EF_ERASE_MIN_SIZE);
+        set_cur_using_data_addr(get_env_start_addr() + EF_ERASE_MIN_SIZE); /* 复位到首个数据扇区 */
         /* save current using data section address to flash*/
         if ((result = save_cur_using_data_addr(get_cur_using_data_addr())) == EF_NO_ERR) {
             /* set default ENV */
@@ -683,7 +776,7 @@ EfErrCode ef_load_env(void) {
             /* save current using data section address to flash*/
             if ((result = save_cur_using_data_addr(get_cur_using_data_addr())) == EF_NO_ERR) {
                 EF_INFO("Warning: ENV end address has error. Set it to default.\n");
-                result = ef_env_set_default();
+                result = ef_env_set_default(); /* 二级判定：详情区游标非法也重建 */
             }
         } else {
             /* set ENV detail part end address */
@@ -691,14 +784,14 @@ EfErrCode ef_load_env(void) {
 
             env_cache_bak = env_cache + ENV_PARAM_PART_WORD_SIZE;
             /* read all ENV from flash */
-            ef_port_read(get_env_detail_addr(), env_cache_bak, get_env_detail_size());
+            ef_port_read(get_env_detail_addr(), env_cache_bak, get_env_detail_size()); /* 详情区回 RAM */
             /* read ENV CRC code from flash */
             ef_port_read(get_cur_using_data_addr() + ENV_PARAM_PART_INDEX_DATA_CRC * 4,
                          &env_cache[ENV_PARAM_PART_INDEX_DATA_CRC], 4);
             /* if ENV CRC32 check is fault, set default for it */
             if (!env_crc_is_ok()) {
                 EF_INFO("Warning: ENV CRC check failed. Set it to default.\n");
-                result = ef_env_set_default();
+                result = ef_env_set_default(); /* 三级判定：CRC 不过即重建 */
             }
         }
 
@@ -706,6 +799,16 @@ EfErrCode ef_load_env(void) {
     return result;
 }
 #else
+/**
+ * 【深注】ef_load_env()（WL+PFS 版）—— 双区 5 张选票的复杂仲裁。
+ *
+ * 与 normal-PFS 的差异：每个区自己还有一个"区内 cur_using_data_addr"（数据段
+ * 可在区内搬家），所以每区先过两道游标票（区游标 + 详情区结束地址），再过
+ * CRC 票；双区全活再比 saved_count（含 0 vs 0xFFFFFFFF 回绕特判）。双双落选
+ * 时还要把两个默认游标各落盘一次（save_cur_using_data_addr×2）才重建默认。
+ *
+ * @return result
+ */
 EfErrCode ef_load_env(void) {
     EfErrCode result = EF_NO_ERR;
     /* ENV area0 current using address default value */
@@ -815,6 +918,20 @@ EfErrCode ef_load_env(void) {
 
 /**
  * Save ENV to flash.
+ * 【深注】ef_save_env() —— WL 模式的灵魂：带"坏块搬家重试"的整块回写循环。
+ *
+ * 核心循环（while cur_using_data_addr + 已用大小 < 数据段末尾-4）：
+ *   1. 算好 CRC -> 在当前位置"擦 + 写"整个镜像；
+ *   2. 擦失败或写失败 -> cur_using_data_addr 与详情区结束地址一起向后平移
+ *      EF_ERASE_MIN_SIZE，continue 重试（乐观策略：认定下一扇区是好的）；
+ *   3. 成功则 break，退出后把搬家过的新游标持久化到系统扇区。
+ * 效果：坏块被绕开、写入位置随保存次数在数据段内游走——软件磨损均衡；
+ * 循环条件兜底空间耗尽（报 EF_ENV_FULL）。PFS 版本再叠加双区乒乓与计数递增。
+ *
+ * @note  平移是"擦写失败后向高位走"，若数据段尾部也满则无路可走，
+ *         这就是 legacy-WL 需要 ENV_AREA_SIZE 预留裕量的原因。
+ *
+ * @return result
  */
 EfErrCode ef_save_env(void) {
     EfErrCode result = EF_NO_ERR;
@@ -828,8 +945,8 @@ EfErrCode ef_save_env(void) {
     }
 
 #ifndef EF_ENV_USING_PFS_MODE
-    data_sec_end_addr = get_env_start_addr() + ENV_AREA_SIZE - 4;
-    cur_using_addr_bak = get_cur_using_data_addr();
+    data_sec_end_addr = get_env_start_addr() + ENV_AREA_SIZE - 4; /* 数据段末尾留 4B 余量 */
+    cur_using_addr_bak = get_cur_using_data_addr(); /* 备份游标：成功后判断是否搬家过 */
 #else
     cur_using_addr_bak = next_save_area_addr;
     /* replace next_save_area_addr with cur_using_data_addr */
@@ -848,6 +965,8 @@ EfErrCode ef_save_env(void) {
 #endif
 
     /* wear leveling process, automatic move ENV to next available position */
+    /* 【深注】循环条件即"当前落点 + 镜像大小"必须压在数据段末尾之内：本位置写不下
+     * 或擦写失败都推动 cur_using_data_addr 后移，直到成功或空间耗尽退出 */
     while (get_cur_using_data_addr() + env_used_size < data_sec_end_addr) {
         /* calculate and cache CRC32 code */
         env_cache[ENV_PARAM_PART_INDEX_DATA_CRC] = calc_env_crc();
@@ -918,6 +1037,9 @@ EfErrCode ef_save_env(void) {
 
 /**
  * Calculate the cached ENV CRC32 value.
+ * 【深注】calc_env_crc() —— CRC 覆盖：详情区结束地址游标(4B) + 详情区数据。
+ * 与 normal 模式的差异：PFS 模式下 saved_count 不参与 CRC（它是仲裁"新钟"，
+ * 允许在写入时先变），只保护游标与数据本体。
  *
  * @return CRC32 value
  */
@@ -935,6 +1057,8 @@ static uint32_t calc_env_crc(void) {
 
 /**
  * Check the ENV CRC32
+ * 【深注】env_crc_is_ok() —— 现算 CRC 与参数区里存的 CRC 比对；前置条件是
+ * env_cache 已载入待校验内容（ef_load_env 两条路径都满足）。
  *
  * @return true is ok
  */
@@ -949,6 +1073,12 @@ static bool env_crc_is_ok(void) {
 
 /**
  * Save current using data section address to flash.
+ * 【深注】save_cur_using_data_addr()（普通模式版）—— 把数据段游标持久化到系统扇区。
+ *
+ * @note  源码细节（记录不改）：ef_port_erase(get_env_start_addr(), 4) 传入的擦除
+ *        长度是 4 字节，而擦除必须以 EF_ERASE_MIN_SIZE 为单位——这要求移植层的
+ *        erase 实现自行把 size 对齐到扇区（demo 移植确实如此处理）。若移植层
+ *        不做兜底，这里会触发移植层的断言或擦除不足，属于对移植方的隐式契约。
  *
  * @param cur_data_addr current using data section address
  *
@@ -976,6 +1106,15 @@ static EfErrCode save_cur_using_data_addr(uint32_t cur_data_addr) {
     return result;
 }
 #else
+/**
+ * 【深注】save_cur_using_data_addr()（PFS 版）—— 先按目标地址判断落在 Area0
+ * 还是 Area1，找到对应区的系统扇区（区首），擦后写该区自己的数据段游标。
+ * 两区游标互不干扰，是双区乒乓能够独立运转的前提。
+ *
+ * @param cur_data_addr current using data section address
+ *
+ * @return result
+ */
 static EfErrCode save_cur_using_data_addr(uint32_t cur_data_addr) {
     EfErrCode result = EF_NO_ERR;
     uint32_t cur_system_sec_addr;
@@ -1008,6 +1147,9 @@ static EfErrCode save_cur_using_data_addr(uint32_t cur_data_addr) {
 
 /**
  * Set and save an ENV. If set ENV is success then will save it.
+ * 【深注】ef_set_and_save_env() —— 旧版一步式写入：set 后立即触发整块搬家回写。
+ * WL 模式下每次调用伴随 1 次数据段擦+写（坏块时更多），高频调用费寿命；
+ * NG 模式中已退化为别名并标记 DEPRECATED。
  *
  * @param key ENV name
  * @param value ENV value
@@ -1028,6 +1170,8 @@ EfErrCode ef_set_and_save_env(const char *key, const char *value) {
 
 /**
  * Del and save an ENV. If del ENV is success then will save it.
+ * 【深注】ef_del_and_save_env() —— 旧版一步式删除 API，语义同 ef_set_and_save_env，
+ * V4.x 起标记 DEPRECATED。
  *
  * @param key ENV name
  *
@@ -1048,6 +1192,9 @@ EfErrCode ef_del_and_save_env(const char *key) {
 #ifdef EF_ENV_AUTO_UPDATE
 /**
  * Auto update ENV to latest default when current EF_ENV_VER is changed.
+ * 【深注】env_auto_update() —— ENV 增量升级（WL 版）：版本号不一致时只补
+ * default_env_set 中缺失的 key，用户改过的既有参数不动，最后 ef_save_env
+ * 落盘。版本号持久化在参数区 VER_NUM 字，随 CRC 之外的机制保护。
  *
  * @return result
  */

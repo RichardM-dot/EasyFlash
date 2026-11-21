@@ -80,6 +80,16 @@ static const uint32_t crc32_table[] =
 };
 
 /**
+ * 【深注】crc32_table —— CRC32 查表法的核心常量表（256 项 × 4B = 1KB）。
+ *
+ * @note  生成多项式为反射形式 0xEDB88320（即标准 CRC-32/ISO-HDLC，与 zlib/以太网
+ *        一致），表项 = 对字节 0~255 逐位做 8 次 "异或移位" 的结果，编译期展开成
+ *        常量放进 .rodata（Flash），运行期零计算成本、零 RAM 占用。
+ * @note  查表法把逐位循环的 O(n*8) 次异或/移位压缩为每字节 1 次查表 + 1 次移位，
+ *        在无硬件 CRC 外设的 MCU 上是速度/体积折中的经典做法。
+ */
+
+/**
  * Calculate the CRC32 value of a memory buffer.
  *
  * @param crc accumulated CRC32 value, must be 0 on first call
@@ -88,16 +98,37 @@ static const uint32_t crc32_table[] =
  *
  * @return calculated CRC32 value
  */
+
+/**
+ * 【深注】ef_calc_crc32() —— 库内唯一的校验函数，掉电安全体系的基石。
+ *
+ * 流式接口设计：首次调用传 crc=0，续算时把上次返回值传回即可对超长数据
+ * 分段计算（ef_env.c 的 read_env() 正是靠它用 32B 小缓冲算整条 KV 的 CRC，
+ * 避免为大 blob 分配大缓冲）。
+ *
+ * 前后两个 `crc ^ ~0U`（即 ^0xFFFFFFFF）是标准 CRC-32 的初值/余数异或约定：
+ *   - 进入时异或全 1：等效于寄存器初值 0xFFFFFFFF，使前导 0 字节也能影响结果；
+ *   - 返回前异或全 1：得到最终余数，且保证空数据返回 0x00000000 而非 0xFFFFFFFF。
+ * EasyFlash 用它覆盖：ENV 节点头(name_len+value_len)+name+value、扇区数据段等，
+ * 任何一处位翻转（掉电半写/磨损坏块）都会被下一次上电校验发现。
+ *
+ * @param  crc  累积 CRC 值，首次调用必须传 0，分段续算传上次返回值
+ * @param  buf  待校验数据（按字节处理，无需对齐）
+ * @param  size 字节数
+ * @return 32 位 CRC 校验值
+ * @note   时间复杂度 O(size)，每字节 1 次查表 + 1 次右移；无临界区，可重入。
+ */
 uint32_t ef_calc_crc32(uint32_t crc, const void *buf, size_t size)
 {
-    const uint8_t *p;
+    const uint8_t *p; /* 逐字节游标：CRC 按字节序处理，与 CPU 大小端无关 */
 
     p = (const uint8_t *)buf;
-    crc = crc ^ ~0U;
+    crc = crc ^ ~0U; /* 前置条件化：crc=0 -> 寄存器初值 0xFFFFFFFF */
 
     while (size--) {
+        /* 查表核心：低 8 位异或当前字节选出表项，寄存器右移 8 位吞掉该字节 */
         crc = crc32_table[(crc ^ *p++) & 0xFF] ^ (crc >> 8);
     }
 
-    return crc ^ ~0U;
+    return crc ^ ~0U; /* 后置条件化：得到最终校验值 */
 }

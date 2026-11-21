@@ -1,6 +1,17 @@
 /*
  * 【中文导读】ef_log.c —— Flash 日志存储（B级导读）
  * 日志当环形存储直接写 Flash：顺序追加、按下标回读。死机排查利器。
+ *
+ * 主要函数（均为对外 API，声明见 easyflash.h 的 LOG 组）：
+ *   ef_log_init   逐扇区读头，恢复环形缓冲 start/end 指针；
+ *   ef_log_get_used_size  已存日志字节数（不含扇区头）；
+ *   ef_log_get_total_size  日志区名义总容量；
+ *   ef_log_read  按逻辑下标读（0 = 最旧），越界截断、跨回卷点分段；
+ *   ef_log_write  追加写；当前扇区写满则擦下一扇区继续，绕圈覆盖最旧；
+ *   ef_log_clean  整区格式化（不可恢复）。
+ *
+ * 数据流位置：easyflash_init 第 4 步扫描扇区头恢复指针；运行期应用日志宏调用
+ * ef_log_write 落盘，崩溃后上电用 ef_log_read 回读——与 ENV 区完全独立的两块扇区。
  */
 
 /*

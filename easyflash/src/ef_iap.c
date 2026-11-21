@@ -1,6 +1,21 @@
 /*
  * 【中文导读】ef_iap.c —— IAP 在线固件升级辅助（B级导读）
  * 设置升级标志、校验固件包 CRC、分包写入。做 OTA 时参考分包校验逻辑。
+ *
+ * 主要函数（均为对外 API，声明见 easyflash.h 的 IAP 组）：
+ *   ef_iap_init   仅地址算术：备份区首址 = EF_START_ADDR + ENV 区 + LOG 区；
+ *   ef_erase_bak_app   清备份区，app_size 向上对齐到擦除粒度；
+ *   ef_erase_spec_user_app   自定义擦除回调版（操作 ef_port 管辖外的 App 区）；
+ *   ef_erase_user_app  擦用户 App 区；
+ *   ef_erase_bl  擦 Bootloader 区；
+ *   ef_write_data_to_bak  分包写入备份区，cur_size 出入参接力断点续传；
+ *   ef_copy_spec_app_from_bak  自定义搬运回调版；
+ *   ef_copy_app_from_bak  备份区 -> App 区（32 字 = 128B 栈缓冲逐块搬）；
+ *   ef_copy_bl_from_bak  备份区 -> Bootloader 区；
+ *   ef_get_bak_app_start_addr  查备份区首址。
+ *
+ * 数据流位置：easyflash_init 第 3 步（只算地址，不碰 Flash）；运行期由 OTA 用户代码
+ * 按"擦备份区 -> 分包写 -> CRC32 校验 -> 搬运 App -> 复位跳转"五步曲调用。
  */
 
 /*

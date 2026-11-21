@@ -26,6 +26,23 @@
  * Created on: 2015-07-14
  */
 
+/*
+ * ============================================================================
+ * 【B级导读】ef_cfg.h —— 全库裁剪与布局配置（移植必改清单）
+ * ----------------------------------------------------------------------------
+ * 必填项（不填编译报错提醒）：
+ *   EF_ERASE_MIN_SIZE  最小擦除粒度（一般=扇区，如 stm32f1 片内 1KB / 2KB）；
+ *   EF_WRITE_GRAN      写粒度 bit：1(NOR) / 8(stm32f4) / 32(stm32f1)；
+ *   EF_START_ADDR      存储区在 Flash 上的物理首地址；
+ *   ENV_AREA_SIZE      ENV 区大小（NG 模式要求 >= 2 扇区，留 1 个空扇区给 GC）。
+ * 功能开关：EF_USING_ENV / EF_USING_IAP / EF_USING_LOG 三大件；
+ *   EF_ENV_AUTO_UPDATE + EF_ENV_VER_NUM 增量升级；EF_BIG_ENDIAN 大端 MCU。
+ * 布局总图见文件中部注释块（ENV 区 -> LOG 区 -> IAP 备份区，依次排列）。
+ * 注意：本文件给出的默认值形如 `/* @note you must define it for a value *／`
+ * 的宏是"故意空着"的占位——直接编译会在对应 .c 的 #error 处拦下。
+ * ============================================================================
+ */
+
 #ifndef EF_CFG_H_
 #define EF_CFG_H_
 
